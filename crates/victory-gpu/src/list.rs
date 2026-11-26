@@ -125,7 +125,7 @@ struct List {
     #[cfg(windows)]
     segment: std::sync::atomic::AtomicUsize,
     #[cfg(windows)]
-    state: std::sync::Mutex<crate::draw::State>,
+    state: crate::host::ListCell<crate::draw::State>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -135,9 +135,9 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
-    // SAFETY: the title passes one of our lists.
-    let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    // SAFETY: the title passes one of our lists and records from one thread at a time.
+    let mut state = unsafe { &(*this.cast::<List>()).state }.borrow_mut();
+    f(list, &mut state);
 }
 
 /// The host list a title list's calls record into (its current segment),
@@ -208,9 +208,9 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
             let Some(next) = next_segment(this) else { return };
             CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             current.close();
-            // SAFETY: the title passes one of our lists.
+            // SAFETY: the title passes one of our lists on its recording thread.
             let list = unsafe { &*this.cast::<List>() };
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
+            list.state.borrow_mut().cut(next);
             next.defer_wait(wait);
             return;
         }
@@ -400,7 +400,7 @@ fn new_list(
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
-            std::sync::Mutex::new(state)
+            crate::host::ListCell::new(state)
         },
     });
     let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
@@ -437,7 +437,7 @@ extern "system" fn list_release(this: This) -> u32 {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!("a list released while a queue still holds part of it: that part runs on its own");
             let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+            let state = std::mem::take(&mut *list.state.borrow_mut());
             leave(held, uploads, state);
         }
     }
@@ -465,8 +465,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     #[cfg(windows)]
     {
         let held = restart(this);
-        // SAFETY: the title passes one of our lists.
-        let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the title passes one of our lists on its recording thread.
+        let mut state = unsafe { &(*this.cast::<List>()).state }.borrow_mut();
         let old = std::mem::take(&mut *state);
         state.reset(pipeline);
         drop(state);

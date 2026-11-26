@@ -976,9 +976,129 @@ pub(crate) mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+
+    #[test]
+    fn list_cell_allows_sequential_mut_and_multiple_shared_borrows() {
+        let cell = super::ListCell::new(10u32);
+        {
+            let mut g = cell.borrow_mut();
+            *g += 5;
+        }
+        let r1 = cell.borrow();
+        let r2 = cell.borrow();
+        assert_eq!((*r1, *r2), (15, 15));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn list_cell_catches_overlapping_mut_borrow() {
+        let cell = super::ListCell::new(0u32);
+        let _r = cell.borrow();
+        let _w = cell.borrow_mut();
+    }
 }
 
 type WidenedWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// Single-owner cell for command-list state that is accessed by one thread at
+/// a time (recording on the title thread, then submission on the queue thread
+/// after close). Debug builds assert that no borrows overlap illegally.
+pub(crate) struct ListCell<T> {
+    value: std::cell::UnsafeCell<T>,
+    #[cfg(debug_assertions)]
+    borrows: std::sync::atomic::AtomicI32,
+}
+
+// SAFETY: command lists are recorded on one thread at a time and handed off
+// to submission only after closing.
+unsafe impl<T: Send> Sync for ListCell<T> {}
+
+impl<T: Default> Default for ListCell<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T> ListCell<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self {
+            value: std::cell::UnsafeCell::new(value),
+            #[cfg(debug_assertions)]
+            borrows: std::sync::atomic::AtomicI32::new(0),
+        }
+    }
+
+    pub(crate) fn borrow(&self) -> ListRef<'_, T> {
+        #[cfg(debug_assertions)]
+        {
+            let prev = self.borrows.fetch_add(1, Ordering::Acquire);
+            assert!(prev >= 0, "ListCell shared borrow while mutably borrowed");
+        }
+        ListRef { cell: self }
+    }
+
+    pub(crate) fn borrow_mut(&self) -> ListRefMut<'_, T> {
+        #[cfg(debug_assertions)]
+        {
+            let prev = self
+                .borrows
+                .compare_exchange(0, -1, Ordering::Acquire, Ordering::Relaxed)
+                .expect("ListCell mutable borrow while already borrowed");
+            debug_assert_eq!(prev, 0);
+        }
+        ListRefMut { cell: self }
+    }
+}
+
+pub(crate) struct ListRef<'a, T> {
+    cell: &'a ListCell<T>,
+}
+
+impl<T> std::ops::Deref for ListRef<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: debug_assertions enforces no active mutable borrow; release
+        // relies on the single-writer command-list invariant.
+        unsafe { &*self.cell.value.get() }
+    }
+}
+
+impl<T> Drop for ListRef<'_, T> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        self.cell.borrows.fetch_sub(1, Ordering::Release);
+    }
+}
+
+pub(crate) struct ListRefMut<'a, T> {
+    cell: &'a ListCell<T>,
+}
+
+impl<T> std::ops::Deref for ListRefMut<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: exclusive borrow enforced by ListCell::borrow_mut.
+        unsafe { &*self.cell.value.get() }
+    }
+}
+
+impl<T> std::ops::DerefMut for ListRefMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: exclusive borrow enforced by ListCell::borrow_mut.
+        unsafe { &mut *self.cell.value.get() }
+    }
+}
+
+impl<T> Drop for ListRefMut<'_, T> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let prev = self.cell.borrows.swap(0, Ordering::Release);
+            debug_assert_eq!(prev, -1);
+        }
+    }
+}
 
 /// UAV writes and heap-writing draws in command-recording order.
 enum WidenedEvent {
@@ -992,7 +1112,11 @@ pub(crate) struct HostList {
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
-    deferred: Mutex<Deferred>,
+    deferred: ListCell<Deferred>,
+    /// Work done once the list has run (kept separate from `deferred` because
+    /// early list resets can attach cleanup closures while a queue holds the
+    /// list).
+    after: Mutex<Vec<Box<dyn Fn() + Send>>>,
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
@@ -1244,7 +1368,6 @@ struct Deferred {
     budget_zeroed: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
-    after: Vec<Box<dyn Fn() + Send>>,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -1389,7 +1512,8 @@ impl Host {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
-                deferred: Mutex::default(),
+                deferred: ListCell::default(),
+                after: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
@@ -1872,7 +1996,7 @@ impl Host {
             }
         }
         for list in runs {
-            for work in &list.deferred().after {
+            for work in &*list.after.lock().unwrap_or_else(|e| e.into_inner()) {
                 work();
             }
         }
@@ -2266,7 +2390,8 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
+        *self.deferred_mut() = Deferred::default();
+        self.after.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2696,8 +2821,12 @@ impl HostList {
         }
     }
 
-    fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
-        self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    fn deferred(&self) -> ListRef<'_, Deferred> {
+        self.deferred.borrow()
+    }
+
+    fn deferred_mut(&self) -> ListRefMut<'_, Deferred> {
+        self.deferred.borrow_mut()
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
@@ -2711,7 +2840,7 @@ impl HostList {
     }
 
     fn defer_title_copy(&self, step: Step) {
-        let mut deferred = self.deferred();
+        let mut deferred = self.deferred_mut();
         deferred.copies.push(step);
         deferred.refreshed.clear();
         deferred.slots.clear();
@@ -2720,7 +2849,7 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
+        self.deferred_mut()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
     }
@@ -2734,7 +2863,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        let mut deferred = self.deferred();
+        let mut deferred = self.deferred_mut();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
@@ -2750,7 +2879,7 @@ impl HostList {
     /// repeats out), timed with the refreshes in `StepRefreshUs`, and a slot
     /// whose buffer is clean adds nothing to the batch.
     pub(crate) fn defer_slot(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>, index: u32) {
-        let mut deferred = self.deferred();
+        let mut deferred = self.deferred_mut();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, index);
         if deferred.slots.insert(key) {
             deferred.copies.push(Step::Slot(viewed.clone(), index));
@@ -2768,7 +2897,7 @@ impl HostList {
         marked: bool,
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
-        self.deferred()
+        self.deferred_mut()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
     }
@@ -2777,7 +2906,7 @@ impl HostList {
     /// (`crate::bindless`): what the heap's views reach is brought up to
     /// date at submission (once until a title copy intervenes).
     pub(crate) fn defer_heap(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
-        let mut deferred = self.deferred();
+        let mut deferred = self.deferred_mut();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
             deferred.copies.push(Step::Heap(viewed.clone()));
@@ -2787,29 +2916,29 @@ impl HostList {
     /// Shaders of the list read title memory through the page table of
     /// view heap `heap` (`crate::memory::prepare` at submission).
     pub(crate) fn defer_memory(&self, heap: usize) {
-        self.deferred().copies.push(Step::Memory(heap));
+        self.deferred_mut().copies.push(Step::Memory(heap));
     }
 
     /// After the list has run, before its writes go back: `check` says
     /// whether its shaders read title memory with no copy.
     pub(crate) fn defer_missed(&self, check: impl Fn() -> bool + Send + 'static) {
-        self.deferred().missed.push(Box::new(check));
+        self.deferred_mut().missed.push(Box::new(check));
     }
 
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().after.push(Box::new(work));
+        self.after.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(work));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
-        self.deferred().writes.push((dst as usize, what, bytes));
+        self.deferred_mut().writes.push((dst as usize, what, bytes));
     }
 
     /// A memory value the list waits for before it starts.
     pub(crate) fn defer_wait(&self, wait: crate::hold::ValueWait) {
-        self.deferred().waits.push(wait);
+        self.deferred_mut().waits.push(wait);
     }
 
     /// The memory values the list waits for before it starts.
@@ -2823,9 +2952,10 @@ impl HostList {
     /// over).
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
-        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
+        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.missed.is_empty();
         drop(d);
         deferred_empty
+            && self.after.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
@@ -2838,7 +2968,7 @@ impl HostList {
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
+        self.deferred_mut().uploads.push(buffer.clone());
         Some((buffer, data))
     }
 
@@ -2847,7 +2977,7 @@ impl HostList {
     pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.mapped_buffer(size, true)?;
         name(&buffer, || format!("list readback {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
+        self.deferred_mut().uploads.push(buffer.clone());
         Some((buffer, data))
     }
 
@@ -2862,7 +2992,7 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().uploads.push(buffer);
+            self.deferred_mut().uploads.push(buffer);
             return Some((gpu, data));
         }
         while let Some(chunk) = s.chunks.get(s.current) {
@@ -2901,7 +3031,7 @@ impl HostList {
                 Some((b, d as usize))
             })
             .as_ref()?;
-        let mut deferred = self.deferred();
+        let mut deferred = self.deferred_mut();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
@@ -2934,19 +3064,19 @@ impl HostList {
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+            self.deferred_mut().kept.push(object);
         }
     }
 
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
-        self.deferred().textures.insert(key)
+        self.deferred_mut().textures.insert(key)
     }
 
     /// Runs `work` on host memory at submission, in order with the copies.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work)));
+        self.deferred_mut().copies.push(Step::Host(Box::new(work)));
     }
 
     /// Brings a texture's staging buffer and host texture `copy` up to date
@@ -2957,7 +3087,7 @@ impl HostList {
         staging: std::sync::Arc<crate::texture::Staging>,
         copy: std::sync::Arc<crate::resource::HostTexture>,
     ) {
-        self.deferred().copies.push(Step::Texture(staging, copy));
+        self.deferred_mut().copies.push(Step::Texture(staging, copy));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
