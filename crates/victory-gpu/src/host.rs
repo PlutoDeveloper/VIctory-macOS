@@ -976,6 +976,42 @@ pub(crate) mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+
+    #[test]
+    fn parallel_batch_flush_updates_multiple_shadows_identically() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if super::host().is_none() {
+            return;
+        }
+        let len = 0x10000usize;
+        let mut ptrs = Vec::new();
+        let mut shadows = Vec::new();
+        for i in 0..3usize {
+            // SAFETY: fresh committed allocation, freed below.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+            assert_ne!(p, 0);
+            let pattern = (0x21 + i as u8).wrapping_mul(3);
+            // SAFETY: `len` committed bytes at `p`.
+            unsafe { std::ptr::write_bytes(p as *mut u8, pattern, len) };
+            let id = 0x9100 + i;
+            crate::shadow::register(id, p as u64, len as u64);
+            let shadow = crate::shadow::find(p as u64, len as u64).expect("shadow");
+            ptrs.push((id, p, pattern));
+            shadows.push(shadow);
+        }
+        let mut batch = super::Batch::default();
+        for (i, &(_, p, _)) in ptrs.iter().enumerate() {
+            batch.add(&shadows[i], p, len);
+        }
+        let copied = batch.flush();
+        assert!(copied >= 3 * len);
+        for (i, &(_, _, pattern)) in ptrs.iter().enumerate() {
+            assert_eq!(shadows[i].read_host(ptrs[i].1 as u64, 4), vec![u32::from_le_bytes([pattern; 4]); 4]);
+            crate::shadow::unregister(ptrs[i].0, ptrs[i].1 as u64);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(ptrs[i].1 as *mut _, 0, MEM_RELEASE) };
+        }
+    }
 }
 
 type WidenedWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
@@ -1860,15 +1896,64 @@ impl Host {
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
-        for (shadow, address, len, goes_back) in &back {
-            let (address, len) = (*address, *len);
-            if *goes_back {
-                let written = shadow.copy_back(address, len);
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        let total_back_bytes: usize = back
+            .iter()
+            .filter(|b| b.3)
+            .map(|b| b.2)
+            .sum();
+        if crate::shadow::parallel_copies_enabled()
+            && total_back_bytes >= crate::shadow::PARALLEL_COPY_MIN_BYTES
+        {
+            type BackGroup = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize, bool)>);
+            let mut groups: Vec<BackGroup> = Vec::new();
+            for (shadow, address, len, goes_back) in &back {
+                match groups
+                    .iter_mut()
+                    .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+                {
+                    Some((_, items)) => items.push((*address, *len, *goes_back)),
+                    None => groups.push((shadow.clone(), vec![(*address, *len, *goes_back)])),
+                }
+            }
+            let shadow_ranges: Vec<(u64, u64)> = groups.iter().map(|(s, _)| s.range()).collect();
+            if groups.len() >= 2 && crate::shadow::ranges_disjoint(&shadow_ranges) {
+                crate::texture::in_parallel(groups.len(), |i| {
+                    let (shadow, items) = &groups[i];
+                    for &(address, len, goes_back) in items {
+                        if goes_back {
+                            let written = shadow.copy_back(address, len);
+                            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                        } else {
+                            shadow.keep_writes(address, len);
+                            crate::memory::note_withheld(len as u64);
+                            crate::memory::drop_withheld(address, len);
+                        }
+                    }
+                });
             } else {
-                shadow.keep_writes(address, len);
-                crate::memory::note_withheld(len as u64);
-                crate::memory::drop_withheld(address, len);
+                for (shadow, address, len, goes_back) in &back {
+                    let (address, len) = (*address, *len);
+                    if *goes_back {
+                        let written = shadow.copy_back(address, len);
+                        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                    } else {
+                        shadow.keep_writes(address, len);
+                        crate::memory::note_withheld(len as u64);
+                        crate::memory::drop_withheld(address, len);
+                    }
+                }
+            }
+        } else {
+            for (shadow, address, len, goes_back) in &back {
+                let (address, len) = (*address, *len);
+                if *goes_back {
+                    let written = shadow.copy_back(address, len);
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                } else {
+                    shadow.keep_writes(address, len);
+                    crate::memory::note_withheld(len as u64);
+                    crate::memory::drop_withheld(address, len);
+                }
             }
         }
         for list in runs {
@@ -3158,10 +3243,61 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
+        let work = std::mem::take(&mut self.refreshes);
+        let total_requested: usize = work
+            .iter()
+            .flat_map(|(_, ranges)| ranges.iter())
+            .map(|(from, to)| to - from)
+            .sum();
         let mut total = 0;
         #[cfg(feature = "diagnostics")]
         let mut counted = crate::copystat::hold();
-        for (shadow, ranges) in self.refreshes.drain(..) {
+        if crate::shadow::parallel_copies_enabled()
+            && work.len() >= 2
+            && total_requested >= crate::shadow::PARALLEL_COPY_MIN_BYTES
+        {
+            type RefreshOut = Vec<(usize, usize, usize, u64)>;
+            let results: Vec<Mutex<RefreshOut>> =
+                (0..work.len()).map(|_| Mutex::default()).collect();
+            crate::texture::in_parallel(work.len(), |i| {
+                let (shadow, ranges) = &work[i];
+                let mut out = Vec::new();
+                for (from, to) in ranges.iter() {
+                    let started = std::time::Instant::now();
+                    let copied = shadow.update(from, to - from);
+                    let us = started.elapsed().as_micros() as u64;
+                    out.push((from, to, copied, us));
+                }
+                *results[i].lock().unwrap_or_else(|e| e.into_inner()) = out;
+            });
+            for ((shadow, _), done) in work.into_iter().zip(results) {
+                let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                let (start, len) = shadow.range();
+                for (from, to, copied, us) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        counted.range(from, to - from, us, 0);
+                        self.summary
+                            .record(from as u64, (to - from) as u64, shadow.gpu(from as u64));
+                    }
+                    PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                    total += copied;
+                    let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
+                    let (_, have) = match self.current.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(vacant) => {
+                            self.extents
+                                .flushed(key, start as usize, (start + len) as usize);
+                            vacant.insert((shadow.clone(), Default::default()))
+                        }
+                        std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+                    };
+                    have.insert(from, to, 0);
+                }
+            }
+            return total;
+        }
+        for (shadow, ranges) in work {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (start, len) = shadow.range();
             for (from, to) in ranges.iter() {
