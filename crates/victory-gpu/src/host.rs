@@ -983,7 +983,7 @@ pub(crate) mod tests {
         if super::host().is_none() {
             return;
         }
-        let len = 0x10000usize;
+        let len = 0x40000usize;
         let mut ptrs = Vec::new();
         let mut shadows = Vec::new();
         for i in 0..3usize {
@@ -1902,7 +1902,7 @@ impl Host {
             .map(|b| b.2)
             .sum();
         if crate::shadow::parallel_copies_enabled()
-            && total_back_bytes >= crate::shadow::PARALLEL_COPY_MIN_BYTES
+            && total_back_bytes >= crate::shadow::PARALLEL_COPY_BACK_MIN_BYTES
         {
             type BackGroup = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize, bool)>);
             let mut groups: Vec<BackGroup> = Vec::new();
@@ -3254,7 +3254,7 @@ impl Batch {
         let mut counted = crate::copystat::hold();
         if crate::shadow::parallel_copies_enabled()
             && work.len() >= 2
-            && total_requested >= crate::shadow::PARALLEL_COPY_MIN_BYTES
+            && total_requested >= crate::shadow::PARALLEL_REFRESH_MIN_BYTES
         {
             type RefreshOut = Vec<(usize, usize, usize, u64)>;
             let results: Vec<Mutex<RefreshOut>> =

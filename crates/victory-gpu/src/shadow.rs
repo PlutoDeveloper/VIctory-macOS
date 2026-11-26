@@ -1299,7 +1299,8 @@ pub(crate) fn forget_read(slot: u32) {
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
-pub(crate) const PARALLEL_COPY_MIN_BYTES: usize = 64 << 10;
+pub(crate) const PARALLEL_REFRESH_MIN_BYTES: usize = 512 << 10;
+pub(crate) const PARALLEL_COPY_BACK_MIN_BYTES: usize = 64 << 10;
 
 fn parallel_copies_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("0"))
@@ -1394,7 +1395,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let shadow_ranges: Vec<(u64, u64)> = by_copy.iter().map(|(copy, _)| copy.range()).collect();
     if parallel_copies_enabled()
         && by_copy.len() >= 2
-        && total_bytes >= PARALLEL_COPY_MIN_BYTES
+        && total_bytes >= PARALLEL_COPY_BACK_MIN_BYTES
         && ranges_disjoint(&shadow_ranges)
     {
         let total_pages: usize = by_copy.iter().map(|(_, list)| list.len()).sum();
