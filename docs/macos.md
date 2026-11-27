@@ -250,7 +250,7 @@ The title has eight loops that write cache lines back with `clwb`, which faults 
 
 ## Title buffers on D3DMetal's pages
 
-Under Rosetta with D3DMetal, memory the title commits read-write with `XMemVirtualAlloc`, in whole 64 KiB pages, is pointed at the pages of a D3DMetal buffer with `mach_vm_remap` (#204). The GPU then reads and writes the title's own memory, so those buffers need no host copy, no copy-back after a submission that wrote them, and no refresh before one. A probe at start-up falls back to the copies if the remap does not work, and `VICTORY_ALIAS_BUFFERS=0` keeps the copies.
+Under Rosetta with D3DMetal on Macs with at least 20 GiB of RAM, memory the title commits read-write with `XMemVirtualAlloc`, in whole 64 KiB pages, is pointed at the pages of a D3DMetal buffer with `mach_vm_remap` (#204). The GPU then reads and writes the title's own memory, so those buffers need no host copy, no copy-back after a submission that wrote them, and no refresh before one. A probe at start-up falls back to the copies if the remap does not work; `VICTORY_ALIAS_BUFFERS=0` keeps the copies, and `VICTORY_ALIAS_BUFFERS=1` enables aliasing on 8–18 GiB Macs.
 
 ## Optional switches for slow storage, low memory and speed
 
